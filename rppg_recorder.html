@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rPPG Signal Recorder</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/5.16.0/d3.min.js"></script>
+    <style>
+        html, body {
+            height: 100%;
+        }
+
+        body {
+            background-color: #f3f3f3;
+            font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+            color: rgba(0, 0, 0, 0.877);
+            width: 90%;
+            margin: 0 auto;
+            text-align: center;
+        }
+
+        #chart {
+            width: 100%;
+            margin: 0 auto;
+            text-align: center;
+            background-color: #f3f3f3;
+        }
+
+        .controls {
+            margin: 20px 0;
+            padding: 20px;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        button {
+            padding: 12px 24px;
+            margin: 5px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        #record {
+            background-color: #28a745;
+            color: white;
+        }
+
+        #record:hover:not(:disabled) {
+            background-color: #218838;
+        }
+
+        #startRecording {
+            background-color: #007bff;
+            color: white;
+        }
+
+        #startRecording:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+
+        #stopRecording {
+            background-color: #dc3545;
+            color: white;
+        }
+
+        #stopRecording:hover:not(:disabled) {
+            background-color: #c82333;
+        }
+
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: white;
+            border-radius: 5px;
+            display: inline-block;
+        }
+
+        .recording {
+            background-color: #ff4444;
+            color: white;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .info-item {
+            background-color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>rPPG Signal Recorder</h1>
+    
+    <div class="controls">
+        <button id="record">Start Camera</button>
+        <button id="startRecording" disabled>Start 1-Minute Recording</button>
+        <button id="stopRecording" disabled>Stop Recording</button>
+    </div>
+
+    <div class="status" id="recordingStatus">Ready to start</div>
+
+    <div class="info-grid">
+        <div class="info-item" id="delay">Frame compute delay: 0</div>
+        <div class="info-item" id="resolution">Video resolution: N/A</div>
+        <div class="info-item" id="frame-time">Frame time: 0</div>
+        <div class="info-item" id="video-time">Video time: 0</div>
+        <div class="info-item" id="frame-fps">Frame count: 0, FPS: 0</div>
+        <div class="info-item" id="signal">X: 0</div>
+        <div class="info-item" id="signal-window">nWindow: 0</div>
+        <div class="info-item" id="recordingTime">Recording time: 0s</div>
+    </div>
+
+    <div id="chart"></div>
+
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="output-canvas"></canvas>
+
+    <script>
+        // Global variables
+        let video, c_tmp, ctx_tmp;
+        let frameCount = 0;
+        let delay = 0; // Set to 0 for maximum FPS
+        let xMeanArr = [];
+        let xMean = 0;
+        let initTime;
+        let isSignal = 0;
+        let acFrame = 0.008;
+        let acWindow = 0.008;
+
+        let nFrame = 0;
+        const WINDOW_LENGTH = 300;
+        let acdc = Array(WINDOW_LENGTH).fill(0.5);
+        let ac = Array(WINDOW_LENGTH).fill(0.5);
+
+        // Recording variables
+        let isRecording = false;
+        let recordingData = [];
+        let recordingStartTime;
+        let recordingTimer;
+        const RECORDING_DURATION = 60000; // 1 minute in milliseconds
+
+        // Chart variables
+        let lineArr = [];
+        const MAX_LENGTH = 100;
+        const DURATION = 100;
+        let chart = realTimeLineChart();
+
+        let constraintsObj = {
+            audio: false,
+            video: true // Start with basic constraints, we'll try more specific ones if this works
+        };
+
+        const inProduction = true;
+        const channel = 'r';
+
+        // Event listeners
+        document.querySelector('#record').addEventListener('click', onRecord);
+        document.querySelector('#startRecording').addEventListener('click', startRecording);
+        document.querySelector('#stopRecording').addEventListener('click', stopRecording);
+
+        function setWH() {
+            let [w, h] = [video.videoWidth, video.videoHeight];
+            document.getElementById('delay').innerHTML = `Frame compute delay: ${delay}ms`;
+            document.getElementById('resolution').innerHTML = `Video resolution: ${w} x ${h}`;
+            c_tmp.setAttribute('width', w);
+            c_tmp.setAttribute('height', h);
+        }
+
+        function init() {
+            c_tmp = document.getElementById('output-canvas');
+            if (inProduction) {
+                c_tmp.style.display = 'none';
+            }
+            ctx_tmp = c_tmp.getContext('2d');
+        }
+
+        function computeFrame() {
+            if (nFrame > DURATION) {
+                ctx_tmp.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+                let frame = ctx_tmp.getImageData(0, 0, video.videoWidth, video.videoHeight);
+
+                const count = frame.data.length / 4;
+                let rgbRed = 0;
+                for (let i = 0; i < count; i++) {
+                    rgbRed += frame.data[i * 4];
+                }
+                xMean = 1 - rgbRed / (count * 255);
+
+                let currentTime = (new Date() - initTime) / 1000;
+                let xMeanData = {
+                    time: currentTime,
+                    x: xMean
+                };
+
+                acdc[nFrame % WINDOW_LENGTH] = xMean;
+
+                if (nFrame % WINDOW_LENGTH == 0) {
+                    document.getElementById('signal-window').innerHTML = `nWindow: ${nFrame / WINDOW_LENGTH}`;
+                    if ((nFrame / 100) % 2 == 0) {
+                        isSignal = 1;
+                        ac = detrend(acdc);
+                        acWindow = windowMean(ac);
+                    } else {
+                        ac = Array(WINDOW_LENGTH).fill(acWindow);
+                        isSignal = 0;
+                    }
+                }
+
+                acFrame = ac[nFrame % WINDOW_LENGTH];
+                xMeanArr.push(xMeanData);
+
+                // Record data if recording is active
+                if (isRecording) {
+                    recordingData.push({
+                        timestamp: currentTime,
+                        raw_signal: xMean,
+                        processed_signal: acFrame,
+                        is_signal: isSignal,
+                        frame_number: nFrame
+                    });
+                }
+
+                document.getElementById('frame-time').innerHTML = `Frame time: ${xMeanData.time.toFixed(2)}s`;
+                document.getElementById('video-time').innerHTML = `Video time: ${video.currentTime.toFixed(2)}s`;
+                document.getElementById('signal').innerHTML = `X: ${xMeanData.x.toFixed(6)}`;
+
+                const fps = (++frameCount / video.currentTime).toFixed(3);
+                document.getElementById('frame-fps').innerHTML = `Frame count: ${frameCount}, FPS: ${fps}`;
+
+                ctx_tmp.putImageData(frame, 0, 0);
+            }
+            nFrame += 1;
+            setTimeout(computeFrame, delay);
+        }
+
+        function windowMean(y) {
+            const n = y.length;
+            let sum = 0;
+            for (let i = 0; i < n; i++) {
+                sum += y[i];
+            }
+            return sum / n;
+        }
+
+        function detrend(y) {
+            const n = y.length;
+            let x = [];
+            for (let i = 0; i <= n; i++) {
+                x.push(i);
+            }
+
+            let sx = 0, sy = 0, sxy = 0, sxx = 0;
+            for (let i = 0; i < n; i++) {
+                sx += x[i];
+                sy += y[i];
+                sxy += x[i] * y[i];
+                sxx += x[i] * x[i];
+            }
+            const mx = sx / n;
+            const my = sy / n;
+            const xx = n * sxx - sx * sx;
+            const xy = n * sxy - sx * sy;
+            const slope = xy / xx;
+            const intercept = my - slope * mx;
+
+            let detrended = [];
+            for (let i = 0; i < n; i++) {
+                detrended.push(y[i] - (intercept + slope * i));
+            }
+            return detrended;
+        }
+
+        function onRecord() {
+            this.disabled = true;
+            
+            // First check if getUserMedia is supported
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert('Camera access is not supported in this browser or requires HTTPS');
+                document.getElementById('record').disabled = false;
+                return;
+            }
+
+            document.getElementById('recordingStatus').textContent = 'Requesting camera permission...';
+
+            // Force permission request by trying to access camera immediately
+            // This should trigger the browser permission prompt
+            async function requestCameraPermission() {
+                try {
+                    // First, check if we already have permission
+                    if ('permissions' in navigator) {
+                        const permission = await navigator.permissions.query({ name: 'camera' });
+                        console.log('Current camera permission state:', permission.state);
+                        
+                        if (permission.state === 'denied') {
+                            throw new Error('Camera permission was previously denied. Please enable it in your browser settings.');
+                        }
+                    }
+
+                    // Try to get a minimal video stream first to trigger permission
+                    console.log('Requesting camera access...');
+                    const testStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    console.log('Camera permission granted!');
+                    
+                    // Stop the test stream
+                    testStream.getTracks().forEach(track => track.stop());
+                    
+                    // Now get the stream with our preferred constraints
+                    return await tryGetUserMediaWithFallback();
+                    
+                } catch (error) {
+                    console.error('Permission request failed:', error);
+                    throw error;
+                }
+            }
+
+            // Try progressively simpler constraints if the first attempt fails
+            async function tryGetUserMediaWithFallback() {
+                const constraints = [
+                    // Try high quality first
+                    {
+                        audio: false,
+                        video: {
+                            width: { ideal: 1280, max: 1920 },
+                            height: { ideal: 720, max: 1080 },
+                            frameRate: { ideal: 60, min: 15 },
+                            facingMode: { ideal: 'environment' }
+                        }
+                    },
+                    // Fall back to medium quality
+                    {
+                        audio: false,
+                        video: {
+                            width: { ideal: 640 },
+                            height: { ideal: 480 },
+                            frameRate: { ideal: 30 },
+                            facingMode: { ideal: 'environment' }
+                        }
+                    },
+                    // Basic video only
+                    {
+                        audio: false,
+                        video: true
+                    }
+                ];
+
+                for (let i = 0; i < constraints.length; i++) {
+                    try {
+                        console.log(`Trying constraints set ${i + 1}:`, constraints[i]);
+                        return await navigator.mediaDevices.getUserMedia(constraints[i]);
+                    } catch (error) {
+                        console.log(`Constraints set ${i + 1} failed:`, error);
+                        if (i === constraints.length - 1) {
+                            throw error; // Last attempt failed
+                        }
+                    }
+                }
+            }
+
+            // Main execution
+            requestCameraPermission()
+                .then(function(mediaStreamObj) {
+                    document.getElementById('recordingStatus').textContent = 'Camera connected, trying to enable flash...';
+                    
+                    // Try to enable torch/flash (optional feature)
+                    const track = mediaStreamObj.getVideoTracks()[0];
+                    console.log('Video track settings:', track.getSettings());
+                    
+                    // Only try torch if ImageCapture is supported
+                    if (typeof ImageCapture !== 'undefined') {
+                        try {
+                            const imageCapture = new ImageCapture(track);
+                            imageCapture.getPhotoCapabilities()
+                                .then(() => {
+                                    return track.applyConstraints({
+                                        advanced: [{ torch: true }]
+                                    });
+                                })
+                                .then(() => {
+                                    document.getElementById('recordingStatus').textContent = 'Camera ready with flash enabled';
+                                })
+                                .catch(err => {
+                                    console.log('Torch not available:', err);
+                                    document.getElementById('recordingStatus').textContent = 'Camera ready (flash not available)';
+                                });
+                        } catch (err) {
+                            console.log('ImageCapture not supported:', err);
+                            document.getElementById('recordingStatus').textContent = 'Camera ready (flash not supported)';
+                        }
+                    } else {
+                        document.getElementById('recordingStatus').textContent = 'Camera ready (flash not supported)';
+                    }
+
+                    video = document.getElementById('video');
+                    if (inProduction) {
+                        video.style.display = 'none';
+                    }
+
+                    if ("srcObject" in video) {
+                        video.srcObject = mediaStreamObj;
+                    } else {
+                        // Fallback for older browsers
+                        video.src = window.URL.createObjectURL(mediaStreamObj);
+                    }
+
+                    video.onloadedmetadata = function(ev) {
+                        video.play().catch(err => {
+                            console.log('Video play error:', err);
+                            alert('Error starting video playback');
+                        });
+                    };
+
+                    init();
+                    video.addEventListener('play', setWH);
+                    video.addEventListener('play', computeFrame);
+                    video.addEventListener('play', drawLineChart);
+
+                    // Enable recording button
+                    document.getElementById('startRecording').disabled = false;
+                    document.getElementById('recordingStatus').textContent = 'Ready to record';
+
+                    video.onpause = function() {
+                        console.log('Video paused');
+                    };
+                })
+                .catch(error => {
+                    console.error('Camera access error:', error);
+                    document.getElementById('recordingStatus').textContent = 'Camera access failed';
+                    
+                    let errorMessage = 'Camera access failed: ';
+                    
+                    if (error.name === 'NotAllowedError' || error.message.includes('denied')) {
+                        errorMessage += '\n\n📱 ANDROID USERS - Try this:\n';
+                        errorMessage += '1. Tap the URL bar\n';
+                        errorMessage += '2. Look for a camera icon 📷 or lock icon 🔒\n';
+                        errorMessage += '3. Tap it and select "Allow Camera"\n';
+                        errorMessage += '4. Refresh the page\n\n';
+                        errorMessage += '🔧 OR manually enable:\n';
+                        errorMessage += '• Browser menu → Site settings → Camera → Allow\n';
+                        errorMessage += '• Android Settings → Apps → [Browser] → Permissions → Camera → Allow';
+                    } else if (error.name === 'NotFoundError') {
+                        errorMessage += 'No camera found on this device.';
+                    } else if (error.name === 'NotSupportedError') {
+                        errorMessage += 'Camera not supported in this browser.';
+                    } else if (error.name === 'SecurityError') {
+                        errorMessage += 'Camera access blocked due to security restrictions. Try using HTTPS.';
+                    } else if (error.name === 'OverconstrainedError') {
+                        errorMessage += 'Camera constraints not supported. Your device camera may not support the requested settings.';
+                    } else {
+                        errorMessage += error.message || 'Unknown error occurred.';
+                    }
+                    
+                    alert(errorMessage);
+                    document.getElementById('record').disabled = false;
+                });
+        }
+
+        function startRecording() {
+            isRecording = true;
+            recordingData = [];
+            recordingStartTime = Date.now();
+            
+            document.getElementById('startRecording').disabled = true;
+            document.getElementById('stopRecording').disabled = false;
+            document.getElementById('recordingStatus').textContent = 'Recording...';
+            document.getElementById('recordingStatus').classList.add('recording');
+
+            // Update recording time display
+            recordingTimer = setInterval(updateRecordingTime, 100);
+
+            // Automatically stop after 1 minute
+            setTimeout(() => {
+                if (isRecording) {
+                    stopRecording();
+                }
+            }, RECORDING_DURATION);
+        }
+
+        function stopRecording() {
+            isRecording = false;
+            clearInterval(recordingTimer);
+            
+            document.getElementById('startRecording').disabled = false;
+            document.getElementById('stopRecording').disabled = true;
+            document.getElementById('recordingStatus').textContent = 'Processing...';
+            document.getElementById('recordingStatus').classList.remove('recording');
+
+            // Generate and download CSV
+            generateCSV();
+            
+            document.getElementById('recordingStatus').textContent = 'Recording complete - CSV downloaded';
+            document.getElementById('recordingTime').innerHTML = 'Recording time: 0s';
+        }
+
+        function updateRecordingTime() {
+            if (isRecording) {
+                const elapsed = (Date.now() - recordingStartTime) / 1000;
+                const remaining = Math.max(0, 60 - elapsed);
+                document.getElementById('recordingTime').innerHTML = 
+                    `Recording time: ${elapsed.toFixed(1)}s (${remaining.toFixed(1)}s remaining)`;
+            }
+        }
+
+        function generateCSV() {
+            if (recordingData.length === 0) {
+                alert('No data to export');
+                return;
+            }
+
+            // CSV headers
+            const headers = ['timestamp', 'raw_signal', 'processed_signal', 'is_signal', 'frame_number'];
+            
+            // Convert data to CSV format
+            let csvContent = headers.join(',') + '\n';
+            
+            recordingData.forEach(row => {
+                const csvRow = [
+                    row.timestamp.toFixed(6),
+                    row.raw_signal.toFixed(8),
+                    row.processed_signal.toFixed(8),
+                    row.is_signal,
+                    row.frame_number
+                ].join(',');
+                csvContent += csvRow + '\n';
+            });
+
+            // Create and download file
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            
+            link.setAttribute('href', url);
+            link.setAttribute('download', `rppg_recording_${timestamp}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            console.log(`CSV exported with ${recordingData.length} data points`);
+        }
+
+        // Chart functions
+        function seedData() {
+            let now = new Date();
+            for (let i = 0; i < MAX_LENGTH; ++i) {
+                lineArr.push({
+                    time: new Date(now.getTime() - initTime - ((MAX_LENGTH - i) * DURATION)),
+                    x: 0.5,
+                    signal: isSignal
+                });
+            }
+        }
+
+        function updateData() {
+            let now = new Date();
+            let lineData = {
+                time: now - initTime,
+                x: acFrame,
+                signal: isSignal
+            };
+            lineArr.push(lineData);
+            lineArr.shift();
+            d3.select("#chart").datum(lineArr).call(chart);
+        }
+
+        function resize() {
+            if (d3.select("#chart svg").empty()) {
+                return;
+            }
+            chart.width(+d3.select("#chart").style("width").replace(/(px)/g, ""));
+            d3.select("#chart").call(chart);
+        }
+
+        function drawLineChart() {
+            initTime = new Date();
+            seedData();
+            window.setInterval(updateData, 100);
+            d3.select("#chart").datum(lineArr).call(chart);
+            d3.select(window).on('resize', resize);
+        }
+
+        // Real-time line chart implementation
+        function realTimeLineChart() {
+            var margin = { top: 20, right: 20, bottom: 50, left: 50 },
+                width = 600,
+                height = 400,
+                duration = 500,
+                color = ['#006400', '#4682b4', '#dc143c'];
+
+            function chart(selection) {
+                selection.each(function(data) {
+                    data = ['x'].map(function(c) {
+                        return {
+                            label: c,
+                            values: data.map(function(d) {
+                                return { time: +d.time, value: d[c], signal: +d.signal };
+                            })
+                        };
+                    });
+
+                    var t = d3.transition().duration(duration).ease(d3.easeLinear),
+                        x = d3.scaleTime().rangeRound([0, width - margin.left - margin.right]),
+                        y = d3.scaleLinear().rangeRound([height - margin.top - margin.bottom, 0]),
+                        z = d3.scaleOrdinal(color);
+
+                    var xMin = d3.min(data, function(c) { return d3.min(c.values, function(d) { return d.time; }) });
+                    var xMax = new Date(new Date(d3.max(data, function(c) {
+                        return d3.max(c.values, function(d) { return d.time; })
+                    })).getTime() - (duration * 2));
+
+                    x.domain([xMin, xMax]);
+                    y.domain([
+                        d3.min(data, function(c) { return d3.min(c.values, function(d) { return d.value; }) }),
+                        d3.max(data, function(c) { return d3.max(c.values, function(d) { return d.value; }) })
+                    ]);
+                    z.domain(data.map(function(c) { return c.label; }));
+
+                    var line = d3.line()
+                        .curve(d3.curveBasis)
+                        .x(function(d) { return x(d.time); })
+                        .y(function(d) { return y(d.value); });
+
+                    var svg = d3.select(this).selectAll("svg").data([data]);
+                    var gEnter = svg.enter().append("svg").append("g");
+                    gEnter.append("g").attr("class", "axis x");
+                    gEnter.append("g").attr("class", "axis y");
+                    gEnter.append("defs").append("clipPath")
+                        .attr("id", "clip")
+                        .append("rect")
+                        .attr("width", width - margin.left - margin.right)
+                        .attr("height", height - margin.top - margin.bottom);
+                    gEnter.append("g")
+                        .attr("class", "lines")
+                        .attr("clip-path", "url(#clip)")
+                        .selectAll(".data").data(data).enter()
+                        .append("path")
+                        .attr("class", "data");
+
+                    var svg = selection.select("svg");
+                    svg.attr('width', width).attr('height', height);
+                    var g = svg.select("g")
+                        .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+                    g.select("defs clipPath rect")
+                        .transition(t)
+                        .attr("width", width - margin.left - margin.right)
+                        .attr("height", height - margin.top - margin.right);
+
+                    g.selectAll("g path.data")
+                        .data(data)
+                        .style("stroke", color[1])
+                        .style("stroke-width", 3)
+                        .style("fill", "none")
+                        .transition()
+                        .duration(duration)
+                        .ease(d3.easeLinear)
+                        .on("start", tick);
+
+                    function tick() {
+                        d3.select(this)
+                            .attr("d", function(d) { return line(d.values); })
+                            .attr("transform", null);
+
+                        var xMinLess = new Date(new Date(xMin).getTime() - duration);
+                        d3.active(this)
+                            .attr("transform", "translate(" + x(xMinLess) + ",0)")
+                            .transition()
+                            .on("start", tick);
+                    }
+                });
+            }
+
+            chart.margin = function(_) {
+                if (!arguments.length) return margin;
+                margin = _;
+                return chart;
+            };
+
+            chart.width = function(_) {
+                if (!arguments.length) return width;
+                width = _;
+                return chart;
+            };
+
+            chart.height = function(_) {
+                if (!arguments.length) return height;
+                height = _;
+                return chart;
+            };
+
+            chart.color = function(_) {
+                if (!arguments.length) return color;
+                color = _;
+                return chart;
+            };
+
+            chart.duration = function(_) {
+                if (!arguments.length) return duration;
+                duration = _;
+                return chart;
+            };
+
+            return chart;
+        }
+    </script>
+</body>
+</html>
